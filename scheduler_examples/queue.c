@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-pcb_t *new_pcb(pid_t pid, uint32_t sockfd, uint32_t time_ms) {
+pcb_t *new_pcb(int32_t pid, uint32_t sockfd, uint32_t time_ms) {
     pcb_t * new_task = malloc(sizeof(pcb_t));
     if (!new_task) return NULL;
 
@@ -13,6 +13,9 @@ pcb_t *new_pcb(pid_t pid, uint32_t sockfd, uint32_t time_ms) {
     new_task->sockfd = sockfd;
     new_task->time_ms = time_ms;
     new_task->ellapsed_time_ms = 0;
+    new_task->level = 0;          // começa sempre no nível mais alto
+    new_task->wait_since_ms = 0;  // ainda não entrou na fila
+	new_task->last_update_time_ms = 0;
     return new_task;
 }
 

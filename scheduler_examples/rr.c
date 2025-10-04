@@ -69,6 +69,8 @@ void rr_scheduler(uint32_t now_ms, queue_t *rq, pcb_t **cpu_task){
         *cpu_task = dequeue_pcb(rq);
         if (*cpu_task){
             (*cpu_task)->status = TASK_RUNNING;
+			(*cpu_task)->slice_start_ms = now_ms;
+			(*cpu_task)->last_update_time_ms = now_ms;
             (*cpu_task)->slice_start_ms    = now_ms;   // início da nova fatia
             // alinhar relógio interno para não descontar duas vezes neste mesmo now_ms
             if ((*cpu_task)->last_update_time_ms < now_ms){

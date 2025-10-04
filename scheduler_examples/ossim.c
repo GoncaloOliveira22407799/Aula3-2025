@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "debug.h"
 
@@ -14,6 +15,8 @@
 
 #include "fifo.h"
 #include "rr.h"
+#include "sjf.h"
+#include "mlfq.h"
 #include "msg.h"
 #include "queue.h"
 
@@ -146,12 +149,14 @@ void check_new_commands(queue_t *command_queue, queue_t *blocked_queue, queue_t 
             current_pcb->time_ms = msg.time_ms;
             current_pcb->ellapsed_time_ms = 0;
             current_pcb->status = TASK_RUNNING;
+            current_pcb->last_update_time_ms = current_time_ms;
             enqueue_pcb(ready_queue, current_pcb);
             DBG("Process %d requested RUN for %d ms\n", current_pcb->pid, current_pcb->time_ms);
         } else if (msg.request == PROCESS_REQUEST_BLOCK) {
             current_pcb->pid = msg.pid; // Set the pid from the message
             current_pcb->time_ms = msg.time_ms;
             current_pcb->status = TASK_BLOCKED;
+            current_pcb->last_update_time_ms = current_time_ms;
             enqueue_pcb(blocked_queue, current_pcb);
             DBG("Process %d requested BLOCK for %d ms\n", current_pcb->pid);
         } else {
@@ -190,14 +195,20 @@ void check_new_commands(queue_t *command_queue, queue_t *blocked_queue, queue_t 
  * @param command_queue The queue where PCBs ready for new instructions will be moved
  * @param current_time_ms The current time in milliseconds
  */
-void check_blocked_queue(queue_t * blocked_queue, queue_t * command_queue, uint32_t current_time_ms) {
-    // Check all elements of the blocked queue for new messages
-    queue_elem_t * elem = blocked_queue->head;
+void check_blocked_queue(queue_t *blocked_queue, queue_t *command_queue, uint32_t current_time_ms) {
+    // Garante que só processamos 1x por tick global (TICKS_MS)
+    static uint32_t last_tick_processed = (uint32_t)-1;
+    if (last_tick_processed == current_time_ms) {
+        return; // já processámos este tick
+    }
+    last_tick_processed = current_time_ms;
+
+    queue_elem_t *elem = blocked_queue->head;
     while (elem != NULL) {
         pcb_t *pcb = elem->pcb;
 
-        // Make sure the time is updated only once per cycle
-        if (pcb->last_update_time_ms < current_time_ms) {
+        // Desconta exatamente 1 tick de I/O, de forma determinística
+        if (pcb->time_ms > 0) {
             if (pcb->time_ms > TICKS_MS) {
                 pcb->time_ms -= TICKS_MS;
             } else {
@@ -205,31 +216,34 @@ void check_blocked_queue(queue_t * blocked_queue, queue_t * command_queue, uint3
             }
         }
 
+        // Opcional: debug para ver o avanço
+        // printf("[DBG] BLOCK pid=%d left=%u at t=%u\n", pcb->pid, pcb->time_ms, current_time_ms);
+
         if (pcb->time_ms == 0) {
-            // Send DONE message to the application
+            // Terminou o I/O: envia DONE e move de volta para a command_queue
             msg_t msg = {
-                .pid = pcb->pid,
+                .pid     = pcb->pid,
                 .request = PROCESS_REQUEST_DONE,
                 .time_ms = current_time_ms
             };
-            if (write(pcb->sockfd, &msg, sizeof(msg_t)) != sizeof(msg_t)) {
-                perror("write");
-            }
-            DBG("Process %d finished BLOCK, sending DONE\n", pcb->pid);
+            (void)!write(pcb->sockfd, &msg, sizeof(msg));
             pcb->status = TASK_COMMAND;
-            pcb->last_update_time_ms = current_time_ms;
+
+            // Re-enfileira no COMMAND
             enqueue_pcb(command_queue, pcb);
 
-            // Remove from blocked queue
-            remove_queue_elem(blocked_queue, elem);
+            // Remove da blocked_queue (liberta apenas o elemento)
             queue_elem_t *tmp = elem;
-            elem = elem->next;  // Do this here, because we free it in the next line
+            elem = elem->next;                 // avança antes de libertar
+            remove_queue_elem(blocked_queue, tmp);
             free(tmp);
-        } else {
-            elem = elem->next;  // If not done already, do it now
+            continue;
         }
+
+        elem = elem->next;
     }
 }
+
 
 static const char *SCHEDULER_NAMES[] = {
     "FIFO",
@@ -248,21 +262,29 @@ typedef enum  {
 } scheduler_en;
 
 scheduler_en get_scheduler(const char *name) {
-    for (int i = 0; SCHEDULER_NAMES[i] != NULL; i++) {
-        if (strcmp(name, SCHEDULER_NAMES[i]) == 0) {
-            return (scheduler_en)i;
-        }
+    char buf[32]; size_t n = 0;
+
+    // trim left
+    while (*name && isspace((unsigned char)*name)) name++;
+
+    // copia token e faz uppercase
+    while (*name && !isspace((unsigned char)*name) && n < sizeof(buf)-1) {
+        buf[n++] = (char)toupper((unsigned char)*name++);
     }
-    printf("Scheduler %s not recognized. Available options are:\n", name);
-    for (int i = 0; SCHEDULER_NAMES[i] != NULL; i++) {
-        printf(" - %s\n", SCHEDULER_NAMES[i]);
-    }
+    buf[n] = '\0';
+
+    if (!strcmp(buf, "FIFO")) return SCHED_FIFO;
+    if (!strcmp(buf, "SJF"))  return SCHED_SJF;
+    if (!strcmp(buf, "RR"))   return SCHED_RR;
+    if (!strcmp(buf, "MLFQ")) return SCHED_MLFQ;
+
+    printf("Scheduler %s not recognized. Available options: FIFO SJF RR MLFQ\n", buf);
     return NULL_SCHEDULER;
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        printf("Usage: %s <scheduler>\nScheduler options: FIFO RR\n", argv[0]);
+        printf("Usage: %s <scheduler>\nScheduler options: FIFO SJF RR MLFQ\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
@@ -290,6 +312,7 @@ int main(int argc, char *argv[]) {
     }
     printf("Scheduler server listening on %s...\n", SOCKET_PATH);
     uint32_t current_time_ms = 0;
+
     while (1) {
         // Check for new connections and/or instructions
         check_new_commands(&command_queue, &blocked_queue, &ready_queue, server_fd, current_time_ms);
@@ -303,13 +326,20 @@ int main(int argc, char *argv[]) {
         usleep(TICKS_MS * 1000/2);
         check_new_commands(&command_queue, &blocked_queue, &ready_queue, server_fd, current_time_ms);
 
+
         // The scheduler handles the READY queue
         switch (scheduler_type) {
             case SCHED_FIFO:
                 fifo_scheduler(current_time_ms, &ready_queue, &CPU);
                 break;
+            case SCHED_SJF:
+                sjf_scheduler(current_time_ms, &ready_queue, &CPU);
+                break;
             case SCHED_RR:
                 rr_scheduler(current_time_ms, &ready_queue, &CPU);
+                break;
+            case SCHED_MLFQ:
+                mlfq_scheduler(current_time_ms, &ready_queue, &CPU);
                 break;
             default:
                 printf("Unknown scheduler type\n");

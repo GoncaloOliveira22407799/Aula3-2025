@@ -3,14 +3,14 @@ project(scheduler_examples C)
 
 set(CMAKE_C_STANDARD 11)
 
-# Simulador (FIFO já pronto)
 add_executable(ossim
         ossim.c
         fifo.c
+        rr.c
+        sjf.c
+        mlfq.c
         queue.c
         burst_queue.c
-        rr.h
-        rr.c
 )
 
 # Expor funções POSIX como sleep/usleep/strdup

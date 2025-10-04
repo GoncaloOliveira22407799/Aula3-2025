@@ -38,7 +38,11 @@ void fifo_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task) {
             (*cpu_task) = NULL;
         }
     }
-    if (*cpu_task == NULL) {            // If CPU is idle
+    if (*cpu_task == NULL) {
         *cpu_task = dequeue_pcb(rq);   // Get next task from ready queue (dequeue from head)
+        if (*cpu_task) {
+            (*cpu_task)->status = TASK_RUNNING;
+            (*cpu_task)->last_update_time_ms = current_time_ms;
+        }
     }
 }
